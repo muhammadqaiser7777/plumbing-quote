@@ -44,6 +44,9 @@ export class Form implements OnInit {
   private leadiDPollTimer: any = null;
   private trustedFormPollTimer: any = null;
   private trustedFormInjected = false;
+  isSubmitting: boolean = false;
+  private leadidInjected: boolean = false;
+  private trustedFormValueReceived: boolean = false;
 
   areaCodesUS = [
     // Alabama
@@ -164,10 +167,39 @@ export class Form implements OnInit {
 
   constructor(private http: HttpClient, private router: Router, private renderer: Renderer2, private el: ElementRef) {}
 
+  onFormKeyDown(event: KeyboardEvent) {
+    // Prevent Enter from submitting the form or advancing when inside inputs
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+    const tag = target.tagName.toLowerCase();
+    const isTextInput = (tag === 'input' || tag === 'textarea' || tag === 'select');
+    if (event.key === 'Enter') {
+      // If focus is on a textarea, allow new line
+      if (tag === 'textarea') return;
+      // Prevent default Enter behavior to avoid accidental submit
+      event.preventDefault();
+      event.stopPropagation();
+      return false as any;
+    }
+  }
+
   ngOnInit() {
     this.fetchIPAddress();
     this.parseUrlParams();
+    // Start TrustedForm injection and ping recording immediately
+    this.injectTrustedForm();
     this.injectTrustedFormPing();
+
+    // Start LeadiD injection immediately in most cases, but when affiliate-style
+    // query params are present delay the first attempt by 10s and then poll every 2s
+    const hasAffiliateParams = !!(this.aff_id || this.transaction_id || this.sub_aff_id);
+    if (hasAffiliateParams) {
+      // delay initial injection by 10 seconds, then poll every 2000ms
+      setTimeout(() => this.injectLeadiD(2000), 10000);
+    } else {
+      // immediate injection, poll rapidly until found
+      this.injectLeadiD(300);
+    }
   }
 
   fetchIPAddress() {
@@ -309,7 +341,9 @@ export class Form implements OnInit {
       if (this.currentStep < this.totalSteps) {
         this.currentStep++;
         if (this.currentStep === 2) {
-          this.injectLeadiD();
+          // ensure LeadiD injection is attempted when reaching step 2
+          // if it wasn't already started on load
+          if (!this.leadidInjected) this.injectLeadiD(300);
         }
       }
     }
@@ -466,6 +500,9 @@ export class Form implements OnInit {
   async submit() {
     this.errors = {};
     if (this.validateCurrentStep()) {
+      // mark submitting, stop retry timers (we'll keep reading latest DOM values)
+      this.isSubmitting = true;
+      this.clearInjectionTimers();
       // Read values from DOM
       this.universalLeadid = (document.getElementById('leadid_token') as HTMLInputElement)?.value || '';
       this.xxTrustedFormCertUrl = (document.querySelector('input[name="xxTrustedFormCertUrl"]') as HTMLInputElement)?.value || '';
@@ -499,18 +536,20 @@ export class Form implements OnInit {
       };
       this.http.post('https://get-plumbing.com/api/ping-proxy.php', payload).subscribe({
         next: (response) => {
+          this.isSubmitting = false;
           this.showThankYou = true;
           setTimeout(() => {
             this.router.navigate(['/']);
           }, 3000);
         },
         error: (error) => {
+          this.isSubmitting = false;
           this.errors['general'] = 'Something went wrong, please click submit again.';
         }
       });
     }
   }
-  private injectLeadiD(): void {
+  private injectLeadiD(pollInterval: number = 300): void {
     try {
       // Ensure the hidden input exists with the correct id and name
       let leadIdInput = document.getElementById('leadid_token') as HTMLInputElement | null;
@@ -548,18 +587,20 @@ export class Form implements OnInit {
         anchor.parentNode.insertBefore(s, anchor);
       }
 
-      // Poll for value until success
+      // Poll for value until success or until submit/thank you
       const poll = () => {
-        if (this.showThankYou) return;
+        if (this.showThankYou || this.isSubmitting) return;
         const el = document.getElementById('leadid_token') as HTMLInputElement | null;
         const val = el?.value || '';
         if (val) {
           this.universalLeadid = val;
+          this.leadidInjected = true;
         } else {
-          this.leadiDPollTimer = setTimeout(poll, 300);
+          this.leadiDPollTimer = setTimeout(poll, pollInterval);
         }
       };
-      setTimeout(poll, 500);
+      // initial poll after a short delay to let the script run
+      this.leadiDPollTimer = setTimeout(poll, Math.min(500, pollInterval));
     } catch (e) {
       console.error('Failed to inject LeadiD:', e);
     }
@@ -580,13 +621,15 @@ export class Form implements OnInit {
 
       document.body.appendChild(tf);
 
-      // Poll the hidden field for the value
+      // Poll the hidden field for the value until success or submit
       const poll = () => {
-        if (this.showThankYou) return;
+        if (this.showThankYou || this.isSubmitting) return;
         const el = document.getElementById('xxTrustedFormCertUrl') as HTMLInputElement | null;
         const val = el?.value || '';
         if (val) {
           this.xxTrustedFormCertUrl = val;
+          this.trustedFormValueReceived = true;
+          return;
         }
         this.trustedFormPollTimer = setTimeout(poll, 300);
       };
@@ -594,6 +637,20 @@ export class Form implements OnInit {
       this.trustedFormPollTimer = setTimeout(poll, 500);
     } catch (e) {
       console.error('Failed to inject TrustedForm:', e);
+    }
+  }
+  private clearInjectionTimers() {
+    try {
+      if (this.leadiDPollTimer) {
+        clearTimeout(this.leadiDPollTimer);
+        this.leadiDPollTimer = null;
+      }
+      if (this.trustedFormPollTimer) {
+        clearTimeout(this.trustedFormPollTimer);
+        this.trustedFormPollTimer = null;
+      }
+    } catch (e) {
+      // ignore
     }
   }
   private injectTrustedFormPing() {
